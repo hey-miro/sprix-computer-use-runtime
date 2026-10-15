@@ -2,8 +2,15 @@ name: Sprix signed Windows runtime
 
 on:
   workflow_dispatch:
-  push:
-    branches: [codex/windows-authenticode]
+    inputs:
+      signing_provider:
+        description: Windows code signing provider
+        required: true
+        default: artifact-signing
+        type: choice
+        options:
+          - artifact-signing
+          - pfx
 
 permissions:
   contents: write
@@ -21,17 +28,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Require signing credentials
+      - name: Require signing configuration
         shell: pwsh
         env:
+          SIGNING_PROVIDER: ${{ inputs.signing_provider }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          ARTIFACT_SIGNING_ENDPOINT: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          ARTIFACT_SIGNING_ACCOUNT_NAME: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
           WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
           WINDOWS_CODE_SIGNING_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64)) {
-            throw "Missing WINDOWS_CODE_SIGNING_PFX_BASE64 repository secret."
+          if ($env:SIGNING_PROVIDER -eq "artifact-signing") {
+            $required = @(
+              "AZURE_CLIENT_ID",
+              "AZURE_TENANT_ID",
+              "AZURE_SUBSCRIPTION_ID",
+              "ARTIFACT_SIGNING_ENDPOINT",
+              "ARTIFACT_SIGNING_ACCOUNT_NAME",
+              "ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME"
+            )
+          } elseif ($env:SIGNING_PROVIDER -eq "pfx") {
+            $required = @(
+              "WINDOWS_CODE_SIGNING_PFX_BASE64",
+              "WINDOWS_CODE_SIGNING_PASSWORD"
+            )
+          } else {
+            throw "Unsupported signing provider: $env:SIGNING_PROVIDER"
           }
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PASSWORD)) {
-            throw "Missing WINDOWS_CODE_SIGNING_PASSWORD repository secret."
+          $missing = $required | Where-Object {
+            [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_))
+          }
+          if ($missing) {
+            throw "Missing signing configuration: $($missing -join ', ')"
           }
 
       - uses: actions/setup-node@v4
@@ -55,7 +86,8 @@ jobs:
           npm run build:ts
           npm run build:native:win
 
-      - name: Sign Windows native module
+      - name: Sign Windows native module with PFX
+        if: inputs.signing_provider == 'pfx'
         shell: pwsh
         env:
           WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
@@ -81,25 +113,58 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "Authenticode signing failed with exit code $LASTEXITCODE."
             }
-            & $signTool.FullName verify /pa /all /v $binary
-            if ($LASTEXITCODE -ne 0) {
-              throw "Authenticode verification failed with exit code $LASTEXITCODE."
-            }
-            $signature = Get-AuthenticodeSignature -LiteralPath $binary
-            if ($signature.Status -ne "Valid" -or -not $signature.SignerCertificate) {
-              throw "Expected a valid Authenticode signature, got $($signature.Status)."
-            }
-            [ordered]@{
-              file = Split-Path $binary -Leaf
-              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
-              status = $signature.Status.ToString()
-              subject = $signature.SignerCertificate.Subject
-              issuer = $signature.SignerCertificate.Issuer
-              thumbprint = $signature.SignerCertificate.Thumbprint
-            } | ConvertTo-Json | Set-Content -Encoding utf8 signing-manifest.json
           } finally {
             Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
           }
+
+      - name: Sign in to Azure with GitHub OIDC
+        if: inputs.signing_provider == 'artifact-signing'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign Windows native module with Artifact Signing
+        if: inputs.signing_provider == 'artifact-signing'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          files: ${{ github.workspace }}\computer-use-napi.win32-x64.node
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify Authenticode signature
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = Join-Path $env:GITHUB_WORKSPACE "computer-use-napi.win32-x64.node"
+          $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName |
+            Select-Object -Last 1
+          if (-not $signTool) {
+            throw "signtool.exe was not found on the Windows runner."
+          }
+          & $signTool.FullName verify /pa /all /v $binary
+          if ($LASTEXITCODE -ne 0) {
+            throw "Authenticode verification failed with exit code $LASTEXITCODE."
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $binary
+          if ($signature.Status -ne "Valid" -or -not $signature.SignerCertificate) {
+            throw "Expected a valid Authenticode signature, got $($signature.Status)."
+          }
+          [ordered]@{
+            provider = "${{ inputs.signing_provider }}"
+            file = Split-Path $binary -Leaf
+            sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
+            status = $signature.Status.ToString()
+            subject = $signature.SignerCertificate.Subject
+            issuer = $signature.SignerCertificate.Issuer
+            thumbprint = $signature.SignerCertificate.Thumbprint
+          } | ConvertTo-Json | Set-Content -Encoding utf8 signing-manifest.json
 
       - name: Verify native module loads with Node 22
         shell: pwsh
