@@ -1,0 +1,133 @@
+name: Sprix signed Windows runtime
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/windows-authenticode]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: sprix-signed-windows-runtime
+  cancel-in-progress: false
+
+jobs:
+  build-sign-release:
+    name: Build, sign, and release Windows x64 runtime
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require signing credentials
+        shell: pwsh
+        env:
+          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODE_SIGNING_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PFX_BASE64)) {
+            throw "Missing WINDOWS_CODE_SIGNING_PFX_BASE64 repository secret."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CODE_SIGNING_PASSWORD)) {
+            throw "Missing WINDOWS_CODE_SIGNING_PASSWORD repository secret."
+          }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build TypeScript and Windows native module
+        run: |
+          npm run build:ts
+          npm run build:native:win
+
+      - name: Sign Windows native module
+        shell: pwsh
+        env:
+          WINDOWS_CODE_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_CODE_SIGNING_PFX_BASE64 }}
+          WINDOWS_CODE_SIGNING_PASSWORD: ${{ secrets.WINDOWS_CODE_SIGNING_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $binary = Join-Path $env:GITHUB_WORKSPACE "computer-use-napi.win32-x64.node"
+          $pfx = Join-Path $env:RUNNER_TEMP "sprix-code-signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes(
+              $pfx,
+              [Convert]::FromBase64String($env:WINDOWS_CODE_SIGNING_PFX_BASE64)
+            )
+            $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+              Sort-Object FullName |
+              Select-Object -Last 1
+            if (-not $signTool) {
+              throw "signtool.exe was not found on the Windows runner."
+            }
+            & $signTool.FullName sign /fd SHA256 /td SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /f $pfx /p $env:WINDOWS_CODE_SIGNING_PASSWORD $binary
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode signing failed with exit code $LASTEXITCODE."
+            }
+            & $signTool.FullName verify /pa /all /v $binary
+            if ($LASTEXITCODE -ne 0) {
+              throw "Authenticode verification failed with exit code $LASTEXITCODE."
+            }
+            $signature = Get-AuthenticodeSignature -LiteralPath $binary
+            if ($signature.Status -ne "Valid" -or -not $signature.SignerCertificate) {
+              throw "Expected a valid Authenticode signature, got $($signature.Status)."
+            }
+            [ordered]@{
+              file = Split-Path $binary -Leaf
+              sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $binary).Hash.ToLowerInvariant()
+              status = $signature.Status.ToString()
+              subject = $signature.SignerCertificate.Subject
+              issuer = $signature.SignerCertificate.Issuer
+              thumbprint = $signature.SignerCertificate.Thumbprint
+            } | ConvertTo-Json | Set-Content -Encoding utf8 signing-manifest.json
+          } finally {
+            Remove-Item -LiteralPath $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify native module loads with Node 22
+        shell: pwsh
+        run: |
+          Copy-Item computer-use-napi.win32-x64.node computer-use-napi.node -Force
+          node --input-type=module -e "const { loadNative } = await import('./dist/native.js'); loadNative(); console.log('signed native module loaded')"
+
+      - name: Pack fixed release tarball
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          npm pack --ignore-scripts --pack-destination release
+          $archive = Get-ChildItem release -Filter *.tgz | Select-Object -First 1
+          if (-not $archive) { throw "npm pack did not produce a tarball." }
+          $archiveHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive.FullName).Hash.ToLowerInvariant()
+          "$archiveHash  $($archive.Name)" | Set-Content -Encoding ascii release/SHA256SUMS
+          Copy-Item signing-manifest.json release/signing-manifest.json
+
+      - name: Attest release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+
+      - name: Publish immutable GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sprix-v7.4.0-1
+          name: Sprix signed computer-use runtime v7.4.0-1
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: release/*
